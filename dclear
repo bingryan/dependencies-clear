@@ -4,11 +4,7 @@ set -e
 # select the path to clean
 cleardir=$(pwd)
 
-echo $cleardir
-
 project_list=$(ls -d ${cleardir}/*)
-
-echo $project_list
 
 for project in $project_list
 
