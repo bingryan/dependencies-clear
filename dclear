@@ -1,0 +1,22 @@
+#! /usr/bin/env bash
+set -e
+
+# select the path to clean
+cleardir=$(pwd)
+
+echo $cleardir
+
+project_list=$(ls -d ${cleardir}/*)
+
+echo $project_list
+
+for project in $project_list
+
+do
+   # rust
+   rm -rf ${project}/target
+   # nodejs/javascript/typescript
+   rm -rf ${project}/node_modules
+   # python
+   rm -rf ${project}.virtualenvs
+done
