@@ -135,60 +135,6 @@ Successfully deleted: 3 directories
 ### Docker Cleanup
 
 ```
-============================================
-           Docker Cleanup
-============================================
-Current Docker disk usage:
-TYPE            TOTAL     ACTIVE    SIZE      RECLAIMABLE
-Images          44        1         23.06GB   22.6GB (98%)
-Containers      3         1         41.9kB    0B (0%)
-Local Volumes   16        1         1.172GB   1.105GB (94%)
-Build Cache     283       0         25.36GB   25.36GB
-
-Remove unused volumes? [y/N]: y
-✓ Removed unused volumes
-Remove build cache? [y/N]: y
-✓ Removed build cache
-
-Docker cleanup complete!
-Updated disk usage:
-TYPE            TOTAL     ACTIVE    SIZE      RECLAIMABLE
-Images          44        1         23.06GB   22.6GB (98%)
-Containers      1         1         41.9kB    0B (0%)
-Local Volumes   1         1         66.91MB   0B (0%)
-Build Cache     109       0         0B        0B
-```
-
-### Dry Run Preview
-
-```shell
-$ dclear --only-docker -d
-
-============================================
-           Docker Cleanup
-============================================
-Current Docker disk usage:
-TYPE            TOTAL     ACTIVE    SIZE      RECLAIMABLE
-Images          44        1         23.06GB   22.6GB (98%)
-Containers      3         1         41.9kB    0B (0%)
-Local Volumes   16        1         1.172GB   1.105GB (94%)
-Build Cache     283       0         25.36GB   25.36GB
-
-[Dry run] The following resources would be removed:
-
-💾 Unused Volumes:
-  Name                                     Driver          Scope
-  advizor_app-db-data                      local           local
-  amazon-crawler_mongodb_data              local           local
-  ... and 13 more
-
-🔨 Build Cache:
-  Size: 25.36GB
-  Reclaimable: 25.36GB
-
-Run without -d to actually remove these resources
-```
-
 ## Scan Depth Explained
 
 The script uses `-maxdepth` to control how deep it scans. The default is **5 levels**.
