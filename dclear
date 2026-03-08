@@ -583,10 +583,10 @@ for i in "${!TO_DELETE[@]}"; do
 
     if rm -rf "$dir" 2>/dev/null; then
         echo -e "${GREEN}✓${NC} $size_human - $dir"
-        ((deleted_count++))
+        deleted_count=$((deleted_count + 1))
     else
         echo -e "${RED}✗${NC} Failed to delete: $dir"
-        ((failed_count++))
+        failed_count=$((failed_count + 1))
     fi
 done
 
