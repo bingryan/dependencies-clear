@@ -1,0 +1,373 @@
+#! /usr/bin/env bash
+set -e
+
+# Default configuration
+DRY_RUN=false
+AUTO_CONFIRM=false
+
+# Color definitions
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+# Show help
+show_help() {
+    cat << EOF
+$(basename "$0") - Clean up Docker images, containers, and other resources
+
+Usage: $(basename "$0") [options] [command]
+
+Commands:
+  all                   Clean everything (images, containers, volumes, networks)
+  images                Clean dangling and unused images
+  containers            Clean stopped containers
+  volumes               Clean unused volumes
+  networks              Clean unused networks
+  cache                 Clean build cache
+  system                Docker system prune (comprehensive cleanup)
+
+Options:
+  -h, --help            Show this help message
+  -d, --dry-run         Preview mode, only show what will be deleted
+  -y, --yes             Auto confirm without interactive confirmation
+  -a, --all             Include unused images (not just dangling)
+
+Examples:
+  $(basename "$0") images              # Clean dangling images
+  $(basename "$0") images -a           # Clean all unused images
+  $(basename "$0") containers          # Clean stopped containers
+  $(basename "$0") all -y              # Clean everything without confirmation
+  $(basename "$0") system -d           # Preview system prune
+  $(basename "$0") -d images           # Dry run for images
+
+EOF
+}
+
+# Check if Docker is running
+check_docker() {
+    if ! docker info > /dev/null 2>&1; then
+        echo -e "${RED}Error: Docker is not running or not installed${NC}"
+        exit 1
+    fi
+}
+
+# Get human-readable size
+human_readable_size() {
+    local size=$1
+    if (( $(echo "$size > 1073741824" | bc -l) )); then
+        echo "$(echo "scale=2; $size/1073741824" | bc)GB"
+    elif (( $(echo "$size > 1048576" | bc -l) )); then
+        echo "$(echo "scale=1; $size/1048576" | bc)MB"
+    else
+        echo "$(echo "scale=0; $size/1024" | bc)KB"
+    fi
+}
+
+# Clean dangling images
+clean_dangling_images() {
+    echo -e "${BLUE}Checking for dangling images...${NC}"
+
+    local images=$(docker images -f "dangling=true" -q)
+    if [ -z "$images" ]; then
+        echo -e "${GREEN}No dangling images found${NC}"
+        return 0
+    fi
+
+    local count=$(echo "$images" | wc -l)
+    echo -e "Found ${YELLOW}$count${NC} dangling images"
+
+    if [ "$DRY_RUN" = true ]; then
+        echo -e "${YELLOW}[Dry run] Would remove $count dangling images${NC}"
+        docker images -f "dangling=true" --format "table {{.Repository}}\t{{.Tag}}\t{{.Size}}\t{{.CreatedAt}}"
+        return 0
+    fi
+
+    if [ "$AUTO_CONFIRM" = false ]; then
+        echo -ne "${YELLOW}Remove $count dangling images? [y/N]: ${NC}"
+        read -r confirm
+        if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+            echo -e "${YELLOW}Skipped${NC}"
+            return 0
+        fi
+    fi
+
+    docker rmi $(docker images -f "dangling=true" -q) > /dev/null 2>&1
+    echo -e "${GREEN}✓ Removed $count dangling images${NC}"
+}
+
+# Clean unused images (not just dangling)
+clean_unused_images() {
+    echo -e "${BLUE}Checking for unused images...${NC}"
+
+    if [ "$DRY_RUN" = true ]; then
+        echo -e "${YELLOW}[Dry run] Images that would be removed:${NC}"
+        docker images --format "table {{.Repository}}\t{{.Tag}}\t{{.Size}}\t{{.ID}}" | grep -v "<none>"
+        return 0
+    fi
+
+    if [ "$AUTO_CONFIRM" = false ]; then
+        echo -ne "${YELLOW}This will remove all images not used by any container. Continue? [y/N]: ${NC}"
+        read -r confirm
+        if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+            echo -e "${YELLOW}Skipped${NC}"
+            return 0
+        fi
+    fi
+
+    local before=$(docker system df --format "{{.Images.Size}}" | head -1)
+    docker image prune -a -f > /dev/null 2>&1
+    local after=$(docker system df --format "{{.Images.Size}}" | head -1)
+    echo -e "${GREEN}✓ Cleaned unused images${NC}"
+}
+
+# Clean stopped containers
+clean_stopped_containers() {
+    echo -e "${BLUE}Checking for stopped containers...${NC}"
+
+    local containers=$(docker ps -aq -f "status=exited")
+    if [ -z "$containers" ]; then
+        echo -e "${GREEN}No stopped containers found${NC}"
+        return 0
+    fi
+
+    local count=$(echo "$containers" | wc -l)
+    echo -e "Found ${YELLOW}$count${NC} stopped containers"
+
+    if [ "$DRY_RUN" = true ]; then
+        echo -e "${YELLOW}[Dry run] Would remove these containers:${NC}"
+        docker ps -a -f "status=exited" --format "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Size}}"
+        return 0
+    fi
+
+    if [ "$AUTO_CONFIRM" = false ]; then
+        echo -ne "${YELLOW}Remove $count stopped containers? [y/N]: ${NC}"
+        read -r confirm
+        if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+            echo -e "${YELLOW}Skipped${NC}"
+            return 0
+        fi
+    fi
+
+    docker rm $containers > /dev/null 2>&1
+    echo -e "${GREEN}✓ Removed $count stopped containers${NC}"
+}
+
+# Clean unused volumes
+clean_volumes() {
+    echo -e "${BLUE}Checking for unused volumes...${NC}"
+
+    # First check if there are any unused volumes (not just dangling)
+    # Volumes are unused if not attached to any container
+    local unused_volumes=$(docker volume ls -q | while read vol; do
+        if ! docker ps -a --filter "volume=$vol" -q | grep -q .; then
+            echo "$vol"
+        fi
+    done)
+
+    if [ -z "$unused_volumes" ]; then
+        echo -e "${GREEN}No unused volumes found${NC}"
+        return 0
+    fi
+
+    local count=$(echo "$unused_volumes" | wc -l)
+    echo -e "Found ${YELLOW}$count${NC} unused volumes"
+
+    if [ "$DRY_RUN" = true ]; then
+        echo -e "${YELLOW}[Dry run] Would remove these volumes:${NC}"
+        docker volume ls -f "dangling=true" --format "table {{.Name}}\t{{.Driver}}"
+        return 0
+    fi
+
+    if [ "$AUTO_CONFIRM" = false ]; then
+        echo -ne "${YELLOW}Remove $count unused volumes? [y/N]: ${NC}"
+        read -r confirm
+        if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+            echo -e "${YELLOW}Skipped${NC}"
+            return 0
+        fi
+    fi
+
+    # Use --all to remove all unused volumes (not just dangling)
+    local prune_output=$(docker volume prune --all -f 2>/dev/null)
+    if echo "$prune_output" | grep -q "Total reclaimed space: 0B"; then
+        echo -e "${YELLOW}No unused volumes were removed${NC}"
+    else
+        echo -e "${GREEN}✓ Removed unused volumes${NC}"
+    fi
+}
+
+# Clean unused networks
+clean_networks() {
+    echo -e "${BLUE}Checking for unused networks...${NC}"
+
+    if [ "$DRY_RUN" = true ]; then
+        echo -e "${YELLOW}[Dry run] Networks that would be removed:${NC}"
+        docker network ls -f "type=custom" --format "table {{.Name}}\t{{.Driver}}"
+        return 0
+    fi
+
+    if [ "$AUTO_CONFIRM" = false ]; then
+        echo -ne "${YELLOW}Remove unused networks? [y/N]: ${NC}"
+        read -r confirm
+        if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+            echo -e "${YELLOW}Skipped${NC}"
+            return 0
+        fi
+    fi
+
+    docker network prune -f > /dev/null 2>&1
+    echo -e "${GREEN}✓ Cleaned unused networks${NC}"
+}
+
+# Clean build cache
+clean_cache() {
+    echo -e "${BLUE}Checking for build cache...${NC}"
+
+    if [ "$DRY_RUN" = true ]; then
+        echo -e "${YELLOW}[Dry run] Build cache that would be removed:${NC}"
+        docker builder df
+        return 0
+    fi
+
+    if [ "$AUTO_CONFIRM" = false ]; then
+        echo -ne "${YELLOW}Remove build cache? [y/N]: ${NC}"
+        read -r confirm
+        if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+            echo -e "${YELLOW}Skipped${NC}"
+            return 0
+        fi
+    fi
+
+    local cache_output=$(docker builder prune -f 2>/dev/null)
+    if [[ -z "$cache_output" ]] || echo "$cache_output" | grep -qE "(Total.*0B|reclaimed space.*0B)"; then
+        echo -e "${YELLOW}No build cache to remove${NC}"
+    else
+        echo -e "${GREEN}✓ Cleaned build cache${NC}"
+    fi
+}
+
+# Comprehensive system prune
+system_prune() {
+    echo -e "${BLUE}Analyzing Docker system...${NC}"
+
+    echo ""
+    echo "Current disk usage:"
+    docker system df
+
+    if [ "$DRY_RUN" = true ]; then
+        echo ""
+        echo -e "${YELLOW}[Dry run] Would run: docker system prune -a${NC}"
+        return 0
+    fi
+
+    echo ""
+    if [ "$AUTO_CONFIRM" = false ]; then
+        echo -ne "${YELLOW}This will remove all unused data (containers, networks, images, build cache). Continue? [y/N]: ${NC}"
+        read -r confirm
+        if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+            echo -e "${YELLOW}Operation cancelled${NC}"
+            exit 0
+        fi
+    fi
+
+    echo ""
+    echo "Running system prune..."
+    docker system prune -a -f
+    echo ""
+    echo -e "${GREEN}✓ System cleanup complete${NC}"
+}
+
+# Clean everything
+clean_all() {
+    clean_stopped_containers
+    clean_volumes
+    clean_networks
+    clean_dangling_images
+
+    if [ "$ALL_IMAGES" = true ]; then
+        clean_unused_images
+    fi
+}
+
+# Parse arguments
+COMMAND=""
+ALL_IMAGES=false
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        -d|--dry-run)
+            DRY_RUN=true
+            shift
+            ;;
+        -y|--yes)
+            AUTO_CONFIRM=true
+            shift
+            ;;
+        -a|--all)
+            ALL_IMAGES=true
+            shift
+            ;;
+        -*)
+            echo -e "${RED}Unknown option: $1${NC}"
+            show_help
+            exit 1
+            ;;
+        *)
+            if [ -z "$COMMAND" ]; then
+                COMMAND="$1"
+            else
+                echo -e "${RED}Error: Multiple commands specified${NC}"
+                exit 1
+            fi
+            shift
+            ;;
+    esac
+done
+
+# Check Docker is available
+check_docker
+
+# Execute command
+case $COMMAND in
+    images)
+        if [ "$ALL_IMAGES" = true ]; then
+            clean_unused_images
+        else
+            clean_dangling_images
+        fi
+        ;;
+    containers)
+        clean_stopped_containers
+        ;;
+    volumes)
+        clean_volumes
+        ;;
+    networks)
+        clean_networks
+        ;;
+    cache)
+        clean_cache
+        ;;
+    system)
+        system_prune
+        ;;
+    all)
+        clean_all
+        ;;
+    "")
+        echo -e "${RED}Error: No command specified${NC}"
+        show_help
+        exit 1
+        ;;
+    *)
+        echo -e "${RED}Unknown command: $COMMAND${NC}"
+        show_help
+        exit 1
+        ;;
+esac
