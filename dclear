@@ -6,7 +6,197 @@ DRY_RUN=false
 AUTO_CONFIRM=false
 SIZE_THRESHOLD=0  # Unit: MB, 0 means no limit
 MAX_DEPTH=5       # Default scan depth
+DOCKER_CLEANUP=false
+DOCKER_ONLY=false
 PARALLEL=true
+
+# Directory patterns to clean (sorted by priority)
+# Docker cleanup function
+clean_docker() {
+    local dry_run=$1
+    local auto_confirm=$2
+
+    echo ""
+    echo "============================================"
+    echo "           Docker Cleanup"
+    echo "============================================"
+
+    # Check Docker is running
+    if ! docker info > /dev/null 2>&1; then
+        echo -e "${RED}Error: Docker is not running${NC}"
+        return 1
+    fi
+
+    # Show current usage
+    echo "Current Docker disk usage:"
+    docker system df
+    echo ""
+
+    if [[ "$dry_run" == true ]]; then
+        echo -e "${YELLOW}[Dry run] The following resources would be removed:${NC}"
+        echo ""
+
+        # Dangling images with details
+        local tmp_file=$(mktemp)
+        docker images -f "dangling=true" --format "{{.ID}}|{{.Size}}|{{.CreatedAt}}" > "$tmp_file"
+        if [[ -s "$tmp_file" ]]; then
+            echo "📦 Dangling Images:"
+            printf "  ${BLUE}%-20s %-15s %s${NC}\n" "ID" "Size" "Created"
+            local img_count=0
+            while IFS='|' read -r id size created; do
+                ((img_count++))
+                if [[ $img_count -le 10 ]]; then
+                    printf "  %-20s %-15s %s\n" "${id:0:19}" "$size" "$created"
+                fi
+            done < "$tmp_file"
+            local total_imgs=$(wc -l < "$tmp_file")
+            if [[ $total_imgs -gt 10 ]]; then
+                echo -e "  ${YELLOW}... and $((total_imgs - 10)) more${NC}"
+            fi
+            echo ""
+        fi
+        rm -f "$tmp_file"
+
+        # Stopped containers with details
+        tmp_file=$(mktemp)
+        docker ps -a -f "status=exited" --format "{{.Names}}|{{.Image}}|{{.Status}}" > "$tmp_file"
+        if [[ -s "$tmp_file" ]]; then
+            echo "🐳 Stopped Containers:"
+            printf "  ${BLUE}%-25s %-30s %s${NC}\n" "Name" "Image" "Status"
+            local container_count=0
+            while IFS='|' read -r name image status; do
+                ((container_count++))
+                if [[ $container_count -le 10 ]]; then
+                    printf "  %-25s %-30s %s\n" "${name:0:24}" "${image:0:29}" "$status"
+                fi
+            done < "$tmp_file"
+            local total_containers=$(wc -l < "$tmp_file")
+            if [[ $total_containers -gt 10 ]]; then
+                echo -e "  ${YELLOW}... and $((total_containers - 10)) more${NC}"
+            fi
+            echo ""
+        fi
+        rm -f "$tmp_file"
+
+        # Unused volumes with details
+        tmp_file=$(mktemp)
+        docker volume ls -f "dangling=true" --format "{{.Name}}|{{.Driver}}|{{.Scope}}" > "$tmp_file"
+        if [[ -s "$tmp_file" ]]; then
+            echo "💾 Unused Volumes:"
+            printf "  ${BLUE}%-40s %-15s %s${NC}\n" "Name" "Driver" "Scope"
+            local vol_count=0
+            while IFS='|' read -r name driver scope; do
+                ((vol_count++))
+                if [[ $vol_count -le 10 ]]; then
+                    printf "  %-40s %-15s %s\n" "${name:0:39}" "$driver" "$scope"
+                fi
+            done < "$tmp_file"
+            local total_vols=$(wc -l < "$tmp_file")
+            if [[ $total_vols -gt 10 ]]; then
+                echo -e "  ${YELLOW}... and $((total_vols - 10)) more${NC}"
+            fi
+            echo ""
+        fi
+        rm -f "$tmp_file"
+
+        # Build cache info
+        local cache_size=$(docker system df --format "{{.BuildCache.Size}}" | head -1)
+        local cache_reclaimable=$(docker system df --format "{{.BuildCache.Reclaimable}}" | head -1)
+        if [[ -n "$cache_size" && "$cache_size" != "0B" ]]; then
+            echo "🔨 Build Cache:"
+            echo "  Size: $cache_size"
+            echo "  Reclaimable: $cache_reclaimable"
+            echo ""
+        fi
+
+        echo -e "${YELLOW}Run without -d to actually remove these resources${NC}"
+        return 0
+    fi
+
+    # Clean dangling images
+    local images=$(docker images -f "dangling=true" -q)
+    if [[ -n "$images" ]]; then
+        if [[ "$auto_confirm" == false ]]; then
+            echo -ne "${YELLOW}Remove dangling images? [y/N]: ${NC}"
+            read -r confirm
+            if [[ "$confirm" =~ ^[Yy]$ ]]; then
+                docker rmi $images > /dev/null 2>&1
+                echo -e "${GREEN}✓ Removed dangling images${NC}"
+            fi
+        else
+            docker rmi $images > /dev/null 2>&1
+            echo -e "${GREEN}✓ Removed dangling images${NC}"
+        fi
+    fi
+
+    # Clean stopped containers first (required before volume cleanup)
+    local containers=$(docker ps -aq -f "status=exited")
+    if [[ -n "$containers" ]]; then
+        if [[ "$auto_confirm" == false ]]; then
+            echo -ne "${YELLOW}Remove stopped containers? [y/N]: ${NC}"
+            read -r confirm
+            if [[ "$confirm" =~ ^[Yy]$ ]]; then
+                docker rm $containers > /dev/null 2>&1
+                echo -e "${GREEN}✓ Removed stopped containers${NC}"
+            fi
+        else
+            docker rm $containers > /dev/null 2>&1
+            echo -e "${GREEN}✓ Removed stopped containers${NC}"
+        fi
+    fi
+
+    # Clean unused volumes (must be done after removing containers)
+    # Use --all to remove all unused volumes, not just dangling ones
+    if [[ "$auto_confirm" == false ]]; then
+        echo -ne "${YELLOW}Remove unused volumes? [y/N]: ${NC}"
+        read -r confirm
+        if [[ "$confirm" =~ ^[Yy]$ ]]; then
+            # First try with --all flag to remove all unused volumes
+            local prune_output=$(docker volume prune --all -f 2>&1)
+            if echo "$prune_output" | grep -q "Total reclaimed space: 0B"; then
+                echo -e "${YELLOW}No unused volumes to remove${NC}"
+            elif echo "$prune_output" | grep -q "Total reclaimed"; then
+                echo -e "${GREEN}✓ Removed unused volumes${NC}"
+            else
+                echo -e "${YELLOW}No volumes were removed${NC}"
+            fi
+        fi
+    else
+        local prune_output=$(docker volume prune --all -f 2>&1)
+        if echo "$prune_output" | grep -q "Total reclaimed space: 0B"; then
+            echo -e "${YELLOW}No unused volumes to remove${NC}"
+        elif echo "$prune_output" | grep -q "Total reclaimed"; then
+            echo -e "${GREEN}✓ Removed unused volumes${NC}"
+        fi
+    fi
+
+    # Clean build cache
+    if [[ "$auto_confirm" == false ]]; then
+        echo -ne "${YELLOW}Remove build cache? [y/N]: ${NC}"
+        read -r confirm
+        if [[ "$confirm" =~ ^[Yy]$ ]]; then
+            local cache_output=$(docker builder prune -f 2>/dev/null)
+            # Check if output contains "0B" or is empty
+            if [[ -z "$cache_output" ]] || echo "$cache_output" | grep -qE "(Total.*0B|reclaimed space.*0B)"; then
+                echo -e "${YELLOW}No build cache to remove${NC}"
+            else
+                echo -e "${GREEN}✓ Removed build cache${NC}"
+            fi
+        fi
+    else
+        local cache_output=$(docker builder prune -f 2>/dev/null)
+        if [[ -z "$cache_output" ]] || echo "$cache_output" | grep -qE "(Total.*0B|reclaimed space.*0B)"; then
+            echo -e "${YELLOW}No build cache to remove${NC}"
+        else
+            echo -e "${GREEN}✓ Removed build cache${NC}"
+        fi
+    fi
+
+    echo ""
+    echo "Docker cleanup complete!"
+    echo "Updated disk usage:"
+    docker system df
+}
 
 # Directory patterns to clean (sorted by priority)
 TARGET_PATTERNS=(
@@ -87,6 +277,8 @@ Options:
   -y, --yes           Auto confirm without interactive confirmation
   -s, --size N        Only show/delete directories larger than N MB (default: 0 = all)
   -m, --maxdepth N    Maximum directory depth to scan (default: 5)
+  --docker            Also clean up Docker images and containers
+  --only-docker       Only clean Docker resources, skip directory scanning
   --no-parallel       Disable parallel size calculation
 
 Examples:
@@ -96,6 +288,8 @@ Examples:
   $(basename "$0") -s 100 -y          # Auto delete dependency directories larger than 100MB
   $(basename "$0") ~/code -d -s 50    # Preview directories larger than 50MB
   $(basename "$0") -m 7 ~/projects    # Scan up to 7 levels deep
+  $(basename "$0") --docker           # Clean project dependencies and Docker resources
+  $(basename "$0") --only-docker -y   # Clean only Docker resources, auto-confirm
 
 EOF
 }
@@ -124,6 +318,15 @@ while [[ $# -gt 0 ]]; do
             MAX_DEPTH="$2"
             shift 2
             ;;
+        --docker)
+            DOCKER_CLEANUP=true
+            shift
+            ;;
+        --only-docker)
+            DOCKER_ONLY=true
+            DOCKER_CLEANUP=true
+            shift
+            ;;
         --no-parallel)
             PARALLEL=false
             shift
@@ -141,6 +344,12 @@ while [[ $# -gt 0 ]]; do
 done
 
 set -- "${POSITIONAL[@]}"
+
+# Handle --only-docker mode (skip directory scanning)
+if [[ "$DOCKER_ONLY" == true ]]; then
+    clean_docker "$DRY_RUN" "$AUTO_CONFIRM"
+    exit 0
+fi
 
 # Set scan directory
 SCAN_DIR="${1:-$(pwd)}"
@@ -240,6 +449,10 @@ done
 # Check if any directories were found
 if [[ ${#FOUND_DIRS_LIST[@]} -eq 0 ]]; then
     echo -e "${GREEN}No dependency directories found!${NC}"
+    # If Docker cleanup is enabled, proceed with it even if no dirs found
+    if [[ "$DOCKER_CLEANUP" == true ]]; then
+        clean_docker "$DRY_RUN" "$AUTO_CONFIRM"
+    fi
     exit 0
 fi
 
@@ -295,6 +508,10 @@ done
 # Display results
 if [[ ${#TO_DELETE[@]} -eq 0 ]]; then
     echo -e "${GREEN}No directories match the size threshold (${SIZE_THRESHOLD}MB)${NC}"
+    # If Docker cleanup is enabled, still proceed with it
+    if [[ "$DOCKER_CLEANUP" == true ]]; then
+        clean_docker "$DRY_RUN" "$AUTO_CONFIRM"
+    fi
     exit 0
 fi
 
@@ -321,9 +538,13 @@ printf "%-12s %s\n" "$(human_readable_size $TOTAL_SIZE)" "Total"
 echo "============================================"
 echo ""
 
-# Exit directly in dry-run mode
+# In dry-run mode, skip actual deletion but still show Docker preview
 if [[ "$DRY_RUN" == true ]]; then
     echo -e "${YELLOW}Dry run complete, no files were deleted${NC}"
+    # If Docker cleanup is enabled, show its preview too
+    if [[ "$DOCKER_CLEANUP" == true ]]; then
+        clean_docker "$DRY_RUN" "$AUTO_CONFIRM"
+    fi
     exit 0
 fi
 
@@ -364,3 +585,8 @@ if [[ $failed_count -gt 0 ]]; then
     echo -e "${RED}Failed to delete: $failed_count directories${NC}"
 fi
 echo "============================================"
+
+# Docker cleanup
+if [[ "$DOCKER_CLEANUP" == true ]]; then
+    clean_docker "$DRY_RUN" "$AUTO_CONFIRM"
+fi
