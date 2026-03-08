@@ -375,18 +375,31 @@ get_dir_size() {
     echo $((kb_size * 1024))
 }
 
-# 获取可读大小
+# Get human-readable size (pure bash, no bc dependency)
 human_readable_size() {
     local size=$1
     local unit="B"
     local value=$size
 
     if (( size > 1073741824 )); then
-        value=$(echo "scale=2; $size/1073741824" | bc)
-        unit="GB"
+        # GB with 2 decimal places using integer math
+        value=$((size * 100 / 1073741824))
+        local integer_part=$((value / 100))
+        local decimal_part=$((value % 100))
+        # Pad decimal part with leading zero if needed
+        if (( decimal_part < 10 )); then
+            echo "${integer_part}.0${decimal_part}GB"
+        else
+            echo "${integer_part}.${decimal_part}GB"
+        fi
+        return
     elif (( size > 1048576 )); then
-        value=$(echo "scale=1; $size/1048576" | bc)
-        unit="MB"
+        # MB with 1 decimal place using integer math
+        value=$((size * 10 / 1048576))
+        local integer_part=$((value / 10))
+        local decimal_part=$((value % 10))
+        echo "${integer_part}.${decimal_part}MB"
+        return
     elif (( size > 1024 )); then
         value=$((size / 1024))
         unit="KB"

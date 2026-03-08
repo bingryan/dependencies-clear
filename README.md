@@ -42,7 +42,25 @@ A tool to clean up project dependency directories, Docker resources, and free up
 
 ## Installation
 
+### One-Click Install (Recommended)
+
 ```shell
+curl -fsSL https://raw.githubusercontent.com/bingryan/dependencies-clear/main/install.sh | sudo bash
+```
+
+Or with `wget`:
+
+```shell
+wget -qO- https://raw.githubusercontent.com/bingryan/dependencies-clear/main/install.sh | sudo bash
+```
+
+### Manual Installation
+
+Clone the repository and run the install script:
+
+```shell
+git clone https://github.com/bingryan/dependencies-clear.git
+cd dependencies-clear
 ./install.sh
 ```
 
