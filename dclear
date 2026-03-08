@@ -1,18 +1,366 @@
 #! /usr/bin/env bash
 set -e
 
-# select the path to clean
-cleardir=$(pwd)
+# Default configuration
+DRY_RUN=false
+AUTO_CONFIRM=false
+SIZE_THRESHOLD=0  # Unit: MB, 0 means no limit
+MAX_DEPTH=5       # Default scan depth
+PARALLEL=true
 
-project_list=$(ls -d ${cleardir}/*)
+# Directory patterns to clean (sorted by priority)
+TARGET_PATTERNS=(
+  # Node.js / JavaScript / TypeScript
+  "node_modules"
+  ".next"
+  ".nuxt"
+  ".turbo"
+  "storybook-static"
+  "coverage"
 
-for project in $project_list
+  # Python
+  ".venv"
+  "venv"
+  "env"
+  "__pycache__"
+  ".pytest_cache"
+  ".mypy_cache"
+  ".ruff_cache"
+  "*.egg-info"
+  "*.egg"
+  "dist"
+  "build"
+  ".tox"
 
-do
-   # rust
-   rm -rf ${project}/target
-   # nodejs/javascript/typescript
-   rm -rf ${project}/node_modules
-   # python
-   rm -rf ${project}.virtualenvs
+  # Rust
+  "target"
+
+  # Java / Kotlin / Android
+  "build"
+  ".gradle"
+
+  # Go
+  "bin"
+  "vendor"
+
+  # .NET
+  "bin"
+  "obj"
+
+  # Tauri specific
+  "src-tauri/target"
+  "src-tauri/gen"
+  "src-tauri/WixTools"
+
+  # General build outputs
+  "dist"
+  "dist-ssr"
+  "out"
+  "build"
+  "release"
+  "*.local"
+  ".cache"
+  ".parcel-cache"
+  ".rollup.cache"
+)
+
+# Color definitions
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Show help
+show_help() {
+    cat << EOF
+$(basename "$0") - Clean project dependency directories to free up disk space
+
+Usage: $(basename "$0") [options] [directory]
+
+Arguments:
+  directory     Root directory to scan (default: current directory)
+
+Options:
+  -h, --help          Show this help message
+  -d, --dry-run       Preview mode, only show directories to be deleted
+  -y, --yes           Auto confirm without interactive confirmation
+  -s, --size N        Only show/delete directories larger than N MB (default: 0 = all)
+  -m, --maxdepth N    Maximum directory depth to scan (default: 5)
+  --no-parallel       Disable parallel size calculation
+
+Examples:
+  $(basename "$0")                    # Scan current directory with interactive confirmation
+  $(basename "$0") ~/projects         # Scan ~/projects directory
+  $(basename "$0") -d                 # Preview mode, see what will be deleted
+  $(basename "$0") -s 100 -y          # Auto delete dependency directories larger than 100MB
+  $(basename "$0") ~/code -d -s 50    # Preview directories larger than 50MB
+  $(basename "$0") -m 7 ~/projects    # Scan up to 7 levels deep
+
+EOF
+}
+
+# 解析参数
+POSITIONAL=()
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        -d|--dry-run)
+            DRY_RUN=true
+            shift
+            ;;
+        -y|--yes)
+            AUTO_CONFIRM=true
+            shift
+            ;;
+        -s|--size)
+            SIZE_THRESHOLD="$2"
+            shift 2
+            ;;
+        -m|--maxdepth)
+            MAX_DEPTH="$2"
+            shift 2
+            ;;
+        --no-parallel)
+            PARALLEL=false
+            shift
+            ;;
+        -*)
+            echo "Unknown option: $1"
+            show_help
+            exit 1
+            ;;
+        *)
+            POSITIONAL+=("$1")
+            shift
+            ;;
+    esac
 done
+
+set -- "${POSITIONAL[@]}"
+
+# Set scan directory
+SCAN_DIR="${1:-$(pwd)}"
+
+if [[ ! -d "$SCAN_DIR" ]]; then
+    echo -e "${RED}Error: Directory does not exist: $SCAN_DIR${NC}"
+    exit 1
+fi
+
+echo -e "${BLUE}Scan directory: $SCAN_DIR${NC}"
+echo -e "${BLUE}Size threshold: ${SIZE_THRESHOLD}MB${NC}"
+echo -e "${BLUE}Max depth: ${MAX_DEPTH}${NC}"
+if [[ "$DRY_RUN" == true ]]; then
+    echo -e "${YELLOW}[Dry run] No files will be deleted${NC}"
+fi
+echo ""
+
+# Get directory size in bytes
+get_dir_size() {
+    local dir="$1"
+    # macOS du doesn't support -b, use -k (KB) then multiply by 1024
+    local kb_size=$(du -sk "$dir" 2>/dev/null | cut -f1)
+    echo $((kb_size * 1024))
+}
+
+# 获取可读大小
+human_readable_size() {
+    local size=$1
+    local unit="B"
+    local value=$size
+
+    if (( size > 1073741824 )); then
+        value=$(echo "scale=2; $size/1073741824" | bc)
+        unit="GB"
+    elif (( size > 1048576 )); then
+        value=$(echo "scale=1; $size/1048576" | bc)
+        unit="MB"
+    elif (( size > 1024 )); then
+        value=$((size / 1024))
+        unit="KB"
+    fi
+
+    echo "${value}${unit}"
+}
+
+# Use regular arrays to store results (compatible with bash 3.2)
+FOUND_DIRS_LIST=()
+
+# Check if directory already exists in the list (or as a subdirectory)
+dir_exists_or_child() {
+    local check_dir="$1"
+    for existing in "${FOUND_DIRS_LIST[@]}"; do
+        if [[ "$check_dir" == "$existing"/* ]] || [[ "$check_dir" == "$existing" ]]; then
+            return 0  # Already exists or is a subdirectory
+        fi
+    done
+    return 1  # Not found
+}
+
+# Find all matching directories
+echo "🔍 Scanning for dependency directories..."
+
+for pattern in "${TARGET_PATTERNS[@]}"; do
+    # Use -path for patterns with separators, -name for others
+    if [[ "$pattern" == */* ]]; then
+        # e.g., src-tauri/target
+        find_pattern="-path"
+        find_expr="*/$pattern"
+    else
+        # e.g., node_modules
+        find_pattern="-name"
+        find_expr="$pattern"
+    fi
+
+    while IFS= read -r -d '' dir; do
+        # Skip nested dependency directories (avoid duplicates)
+        # node_modules inside node_modules
+        if [[ "$dir" == *"node_modules"* ]] && [[ "$dir" != */node_modules ]]; then
+            continue
+        fi
+        # target inside target (edge cases)
+        if [[ "$dir" == *"/target/"* ]] && [[ "$dir" != */target ]]; then
+            continue
+        fi
+        # src-tauri/target nesting (unlikely but for safety)
+        if [[ "$dir" == *"src-tauri/target"* ]] && [[ "$dir" != */src-tauri/target ]]; then
+            continue
+        fi
+
+        # Check if a parent directory is already recorded (avoid duplicates)
+        if ! dir_exists_or_child "$dir"; then
+            FOUND_DIRS_LIST+=("$dir")
+        fi
+    done < <(find "$SCAN_DIR" -maxdepth $MAX_DEPTH $find_pattern "$find_expr" -type d -print0 2>/dev/null || true)
+done
+
+# Check if any directories were found
+if [[ ${#FOUND_DIRS_LIST[@]} -eq 0 ]]; then
+    echo -e "${GREEN}No dependency directories found!${NC}"
+    exit 0
+fi
+
+echo "📊 Calculating directory sizes..."
+
+# Calculate sizes (serial, compatible with bash 3.2)
+DIR_SIZES_LIST=()
+for dir in "${FOUND_DIRS_LIST[@]}"; do
+    size=$(get_dir_size "$dir")
+    DIR_SIZES_LIST+=("$size")
+done
+
+# Filter and prepare for display
+declare -a TO_DELETE
+declare -a TO_DELETE_SIZES
+declare -a TO_DELETE_HUMAN
+TOTAL_SIZE=0
+
+for i in "${!FOUND_DIRS_LIST[@]}"; do
+    dir="${FOUND_DIRS_LIST[$i]}"
+    size="${DIR_SIZES_LIST[$i]}"
+    size_mb=$((size / 1048576))
+
+    # Apply size threshold filter
+    if (( size_mb >= SIZE_THRESHOLD )); then
+        TO_DELETE+=("$dir")
+        TO_DELETE_SIZES+=("$size")
+        TO_DELETE_HUMAN+=("$(human_readable_size $size)")
+        TOTAL_SIZE=$((TOTAL_SIZE + size))
+    fi
+done
+
+# Sort by size (bubble sort)
+for ((i=0; i<${#TO_DELETE[@]}; i++)); do
+    for ((j=i+1; j<${#TO_DELETE[@]}; j++)); do
+        if [[ ${TO_DELETE_SIZES[$j]} -gt ${TO_DELETE_SIZES[$i]} ]]; then
+            # Swap directory
+            tmp="${TO_DELETE[$i]}"
+            TO_DELETE[$i]="${TO_DELETE[$j]}"
+            TO_DELETE[$j]="$tmp"
+            # Swap size
+            tmp="${TO_DELETE_SIZES[$i]}"
+            TO_DELETE_SIZES[$i]="${TO_DELETE_SIZES[$j]}"
+            TO_DELETE_SIZES[$j]="$tmp"
+            # Swap human-readable size
+            tmp="${TO_DELETE_HUMAN[$i]}"
+            TO_DELETE_HUMAN[$i]="${TO_DELETE_HUMAN[$j]}"
+            TO_DELETE_HUMAN[$j]="$tmp"
+        fi
+    done
+done
+
+# Display results
+if [[ ${#TO_DELETE[@]} -eq 0 ]]; then
+    echo -e "${GREEN}No directories match the size threshold (${SIZE_THRESHOLD}MB)${NC}"
+    exit 0
+fi
+
+echo ""
+echo "============================================"
+echo "           Directories to Clean             "
+echo "============================================"
+printf "%-12s %s\n" "Size" "Path"
+echo "--------------------------------------------"
+
+for i in "${!TO_DELETE[@]}"; do
+    size_human="${TO_DELETE_HUMAN[$i]}"
+    dir="${TO_DELETE[$i]}"
+    # Truncate long paths
+    display_dir="$dir"
+    if [[ ${#display_dir} -gt 60 ]]; then
+        display_dir="...${display_dir: -57}"
+    fi
+    printf "%-12s %s\n" "$size_human" "$display_dir"
+done
+
+echo "--------------------------------------------"
+printf "%-12s %s\n" "$(human_readable_size $TOTAL_SIZE)" "Total"
+echo "============================================"
+echo ""
+
+# Exit directly in dry-run mode
+if [[ "$DRY_RUN" == true ]]; then
+    echo -e "${YELLOW}Dry run complete, no files were deleted${NC}"
+    exit 0
+fi
+
+# Confirm deletion
+if [[ "$AUTO_CONFIRM" == false ]]; then
+    echo -ne "${YELLOW}Confirm deletion of all directories above? [y/N]: ${NC}"
+    read -r confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        echo -e "${YELLOW}Operation cancelled${NC}"
+        exit 0
+    fi
+fi
+
+# Execute deletion
+echo ""
+echo "🗑️  Deleting..."
+deleted_count=0
+failed_count=0
+
+for i in "${!TO_DELETE[@]}"; do
+    dir="${TO_DELETE[$i]}"
+    size_human="${TO_DELETE_HUMAN[$i]}"
+
+    if rm -rf "$dir" 2>/dev/null; then
+        echo -e "${GREEN}✓${NC} $size_human - $dir"
+        ((deleted_count++))
+    else
+        echo -e "${RED}✗${NC} Failed to delete: $dir"
+        ((failed_count++))
+    fi
+done
+
+echo ""
+echo "============================================"
+echo -e "${GREEN}Space freed: $(human_readable_size $TOTAL_SIZE)${NC}"
+echo "Successfully deleted: $deleted_count directories"
+if [[ $failed_count -gt 0 ]]; then
+    echo -e "${RED}Failed to delete: $failed_count directories${NC}"
+fi
+echo "============================================"

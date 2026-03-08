@@ -14,8 +14,9 @@ binpaths="/usr/local/bin /usr/bin"
 is_write_perm_missing=""
 
 for binpath in $binpaths; do
-  if mv "$bin" "$binpath/dclear" ; then
-    echo "Moved $bin to $binpath"
+  if cp "$bin" "$binpath/dclear" ; then
+    chmod +x "$binpath/dclear"
+    echo "Installed $bin to $binpath"
     exit 0
   else
     if [ -d "$binpath" ] && [ ! -w "$binpath" ]; then
